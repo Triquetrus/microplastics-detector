@@ -109,10 +109,6 @@ theme_choice = st.sidebar.radio("Theme", ["🌑 Dark", "🌕 Light (Sky Blue)"],
 # Map to internal theme label
 st.session_state.theme = "dark" if theme_choice.startswith("🌑") else "light"
 
-# Model path (absolute)
-model_path_input = st.sidebar.text_input("Model path (absolute)", value=st.session_state.model_path, key="model_path_input")
-st.session_state.model_path = model_path_input.strip()
-
 device_choice = st.sidebar.selectbox("Device", ["GPU", "CPU"], index=0, key="device_choice")
 device = 0 if str(device_choice).startswith("GPU") else "CPU"
 
@@ -121,6 +117,9 @@ max_display = st.sidebar.slider("Max detections shown in confidence plot", 5, 20
 box_thickness = st.sidebar.slider("Box thickness (px)", 1, 8, 2, key="box_thickness")
 
 st.sidebar.markdown("---")
+st.sidebar.subheader("⚡ Quick Links")
+st.sidebar.markdown("[GitHub Repo](https://github.com/Triquetrus/microplastics-detector)")
+st.sidebar.markdown("[Streamlit Docs](https://docs.streamlit.io/)")
 st.sidebar.markdown("Tips:")
 st.sidebar.markdown("- Use a clear close-up image of the sample.")
 st.sidebar.markdown("- Increase confidence threshold to reduce false positives.")
@@ -208,57 +207,40 @@ def _cached_load_model(path: str):
         raise ImportError("ultralytics YOLO not available")
     return YOLO(path)
 
-# Google Drive direct download link
+# Default Google Drive model
 MODEL_URL = "https://drive.google.com/uc?export=download&id=1Rh85Qh47pdL763DkvnFsja_skovUU7eB"
-MODEL_PATH = "best.pt"
+DEFAULT_MODEL_PATH = "best.pt"
 
-# Download model if not present
-if not os.path.exists(MODEL_PATH):
-    with st.spinner("Downloading YOLOv8 model..."):
-        st.info("Downloading model from Google Drive...")
-        os.system(f"wget {MODEL_URL} -O {MODEL_PATH}")
+# Sidebar: optional user upload
+uploaded_model = st.sidebar.file_uploader(
+    "Upload YOLOv8 model (.pt) to override the default", type=["pt"]
+)
+
+# Decide which model to use
+if uploaded_model is not None:
+    model_path = uploaded_model.name
+    with open(model_path, "wb") as f:
+        f.write(uploaded_model.getbuffer())
+    st.sidebar.success("✅ Custom model uploaded")
+else:
+    model_path = DEFAULT_MODEL_PATH
+    if not os.path.exists(model_path):
+        with st.spinner("Downloading YOLOv8 model from Google Drive..."):
+            os.system(f"wget {MODEL_URL} -O {model_path}")
+        st.sidebar.success("✅ Default model downloaded")
 
 # Load the model using cached function
 model = None
 model_error = None
 try:
     with st.spinner("Loading YOLO model..."):
-        model = _cached_load_model(MODEL_PATH)
-    st.sidebar.success("Model loaded ✅")
+        model = _cached_load_model(model_path)
+    st.sidebar.success("✅ Model loaded successfully")
 except Exception as e:
     model_error = str(e)
-    st.sidebar.error(f"Failed to load model ❌: {model_error}")
+    st.sidebar.error(f"❌ Failed to load model: {model_error}")
 
-"""
-if using model from directly your machine use this otherwise use the above code
-@st.cache_resource
-def _cached_load_model(path: str):
-    if YOLO is None:
-        raise ImportError(f"ultralytics YOLO not available: {YOLO_IMPORT_ERROR}")
-    return YOLO(path)
 
-model = None
-model_error = None
-if st.session_state.model_path:
-    if os.path.exists(st.session_state.model_path):
-        try:
-            # Only reload if path changed
-            if st.session_state.model_loaded_for != st.session_state.model_path:
-                with st.spinner("Loading YOLO model..."):
-                    model = _cached_load_model(st.session_state.model_path)
-                st.session_state.model_loaded_for = st.session_state.model_path
-            else:
-                # model already cached by load function; try to get from cache by calling
-                model = _cached_load_model(st.session_state.model_path)
-            st.sidebar.success("Model loaded ✅")
-        except Exception as e:
-            model_error = str(e)
-            st.sidebar.error("Failed to load model ❌")
-    else:
-        model_error = f"Model file not found at: {st.session_state.model_path}"
-        st.sidebar.warning("Model file path not found. Paste correct absolute path.")
-else:
-    st.sidebar.info("Paste the absolute path to your YOLO weights (best.pt) above.")"""
 
 # ----------------------------- APP HEADER -----------------------------
 st.markdown(f"<div class='card'><div class='title'>{APP_TITLE}</div><div class='muted'>{APP_SUBTITLE}</div></div>", unsafe_allow_html=True)
