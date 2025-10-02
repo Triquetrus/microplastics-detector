@@ -1,0 +1,5 @@
+train: ../data/raw/microplastic_dataset/train/images
+val: ../data/raw/microplastic_dataset/valid/images
+
+nc: 1
+names: ["Microplastic"]

@@ -1,0 +1,9 @@
+# Paths to images
+train: D:/microplastic_project/microplastic-detection/microplastic-detection/data/raw/microplastic_dataset/train/images
+val: D:/microplastic_project/microplastic-detection/microplastic-detection/data/raw/microplastic_dataset/valid/images
+
+# Number of classes
+nc: 1
+
+# Class names
+names: ['microplastic']
