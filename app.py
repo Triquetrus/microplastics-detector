@@ -29,6 +29,7 @@ from PIL import Image
 import matplotlib.pyplot as plt
 from matplotlib import cm
 import streamlit as st
+import requests
 
 # Attempt to import ultralytics YOLO
 try:
@@ -40,7 +41,6 @@ except Exception as e:
 
 # ----------------------------- CONFIG -----------------------------
 st.set_page_config(page_title="Microplastic Detector", layout="wide", page_icon="🧫")
-
 st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
 
 header_html = f"""
@@ -50,9 +50,6 @@ header_html = f"""
 </div>
 """
 st.markdown(header_html, unsafe_allow_html=True)
-
-# Default: change this to your absolute path if different
-DEFAULT_MODEL_PATH = r"D:\microplastic_project\runs\detect\microplastic_train2\weights\best.pt"
 
 APP_TITLE = "⚛Microplastic Detector"
 APP_SUBTITLE = "📸Upload an image, detect microplastics using your YOLOv8 model, and present easy-to-understand visualizations."
@@ -76,37 +73,33 @@ def pil_to_bytes(img: Image.Image, fmt: str = "PNG") -> bytes:
 
 # ----------------------------- SESSION STATE INIT -----------------------------
 if "theme" not in st.session_state:
-    st.session_state.theme = "dark"  # internal key, maps to sidebar radio
+    st.session_state.theme = "dark"
 
 if "model_path" not in st.session_state:
-    st.session_state.model_path = DEFAULT_MODEL_PATH
+    st.session_state.model_path = "best.pt"
 
 if "image" not in st.session_state:
-    st.session_state.image = None  # PIL Image
+    st.session_state.image = None
 
 if "annotated" not in st.session_state:
-    st.session_state.annotated = None  # PIL Image
+    st.session_state.annotated = None
 
 if "df" not in st.session_state:
-    st.session_state.df = pd.DataFrame()  # detections DataFrame
+    st.session_state.df = pd.DataFrame()
 
 if "history" not in st.session_state:
-    st.session_state.history = []  # list of dicts: {filename,timestamp,df,annotated,elapsed}
+    st.session_state.history = []
 
 if "model_loaded_for" not in st.session_state:
-    st.session_state.model_loaded_for = None  # model path loaded
+    st.session_state.model_loaded_for = None
 
-    # ---------------- SESSION STATE STAGE ----------------
 if "stage" not in st.session_state:
-    st.session_state.stage = "initial"  # possible values: initial, uploaded, detected
-
+    st.session_state.stage = "initial"
 
 # ----------------------------- SIDEBAR: SETTINGS & THEME -----------------------------
 st.sidebar.markdown("## ⚙️ Settings")
 
-# Theme toggle (use radio with keys so state persists after reruns)
 theme_choice = st.sidebar.radio("Theme", ["🌑 Dark", "🌕 Light (Sky Blue)"], index=0, key="theme_radio")
-# Map to internal theme label
 st.session_state.theme = "dark" if theme_choice.startswith("🌑") else "light"
 
 device_choice = st.sidebar.selectbox("Device", ["GPU", "CPU"], index=0, key="device_choice")
@@ -126,7 +119,6 @@ st.sidebar.markdown("- Increase confidence threshold to reduce false positives."
 st.sidebar.markdown("- Use GPU if available for faster inference.")
 
 # ----------------------------- THEME STYLING -----------------------------
-# Theme palettes
 if st.session_state.theme == "dark":
     PAGE_BG = "linear-gradient(135deg, #0f1724 0%, #2b2143 40%, #6e5b7b 100%)"
     CARD_BG = "rgba(255,255,255,0.04)"
@@ -148,8 +140,6 @@ else:
     CONF_CMAP = "coolwarm"
     MT_FIG_FACE = "#e6f7ff"
 
-# Inject CSS
-# Extra widget theming so Streamlit UI matches our dark/light toggle
 if st.session_state.theme == "dark":
     WIDGET_BG = "#1e1e2f"
     WIDGET_TEXT = "#f5f5f5"
@@ -186,8 +176,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-
-# Matplotlib config for theme
 plt.rcParams.update({
     "figure.facecolor": MT_FIG_FACE,
     "axes.facecolor": MT_FIG_FACE,
@@ -200,34 +188,29 @@ plt.rcParams.update({
 })
 
 # ----------------------------- MODEL LOADING (cached) -----------------------------
-
 @st.cache_resource
 def _cached_load_model(path: str):
     if YOLO is None:
         raise ImportError("ultralytics YOLO not available")
     return YOLO(path)
 
-# Default Google Drive model
 MODEL_URL = "https://drive.google.com/uc?export=download&id=1Rh85Qh47pdL763DkvnFsja_skovUU7eB"
 DEFAULT_MODEL_PATH = "best.pt"
 
 def download_file(url, filename):
-    if not os.path.exists(filename):
-        with st.spinner(f"Downloading {filename}..."):
-            response = requests.get(url, stream=True)
-            total_size = int(response.headers.get('content-length', 0))
-            chunk_size = 1024
-            with open(filename, 'wb') as f:
-                for data in response.iter_content(chunk_size):
-                    f.write(data)
-            st.success(f"✅ {filename} downloaded")
+    with st.spinner(f"Downloading {filename}..."):
+        response = requests.get(url, stream=True)
+        total_size = int(response.headers.get('content-length', 0))
+        chunk_size = 1024
+        with open(filename, 'wb') as f:
+            for data in response.iter_content(chunk_size):
+                f.write(data)
+        st.success(f"✅ {filename} downloaded")
 
-# Sidebar: optional user upload
 uploaded_model = st.sidebar.file_uploader(
     "Upload YOLOv8 model (.pt) to override the default", type=["pt"]
 )
 
-# Decide which model to use
 if uploaded_model is not None:
     model_path = uploaded_model.name
     with open(model_path, "wb") as f:
@@ -237,7 +220,6 @@ else:
     model_path = DEFAULT_MODEL_PATH
     download_file(MODEL_URL, model_path)
 
-# Load the model using cached function
 model = None
 model_error = None
 try:
@@ -247,7 +229,6 @@ try:
 except Exception as e:
     model_error = str(e)
     st.sidebar.error(f"❌ Failed to load model: {model_error}")
-
 
 
 # ----------------------------- APP HEADER -----------------------------
