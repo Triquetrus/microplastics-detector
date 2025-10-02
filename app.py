@@ -211,6 +211,17 @@ def _cached_load_model(path: str):
 MODEL_URL = "https://drive.google.com/uc?export=download&id=1Rh85Qh47pdL763DkvnFsja_skovUU7eB"
 DEFAULT_MODEL_PATH = "best.pt"
 
+def download_file(url, filename):
+    if not os.path.exists(filename):
+        with st.spinner(f"Downloading {filename}..."):
+            response = requests.get(url, stream=True)
+            total_size = int(response.headers.get('content-length', 0))
+            chunk_size = 1024
+            with open(filename, 'wb') as f:
+                for data in response.iter_content(chunk_size):
+                    f.write(data)
+            st.success(f"✅ {filename} downloaded")
+
 # Sidebar: optional user upload
 uploaded_model = st.sidebar.file_uploader(
     "Upload YOLOv8 model (.pt) to override the default", type=["pt"]
@@ -224,10 +235,7 @@ if uploaded_model is not None:
     st.sidebar.success("✅ Custom model uploaded")
 else:
     model_path = DEFAULT_MODEL_PATH
-    if not os.path.exists(model_path):
-        with st.spinner("Downloading YOLOv8 model from Google Drive..."):
-            os.system(f"wget {MODEL_URL} -O {model_path}")
-        st.sidebar.success("✅ Default model downloaded")
+    download_file(MODEL_URL, model_path)
 
 # Load the model using cached function
 model = None

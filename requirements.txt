@@ -1,7 +1,8 @@
 streamlit
 ultralytics
-opencv-python-headless
-pillow
-matplotlib
+opencv-python
+numpy
 pandas
+matplotlib
 seaborn
+requests
