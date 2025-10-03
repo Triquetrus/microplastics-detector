@@ -31,13 +31,25 @@ from matplotlib import cm
 import streamlit as st
 import requests
 
+
+import subprocess, sys, importlib.util
+
+package_name = "ultralytics"
+
+if importlib.util.find_spec(package_name) is None:
+    st.warning("Ultralytics not found, installing now (this may take 5–10 min)...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", package_name])
+
 # Attempt to import ultralytics YOLO
 try:
     from ultralytics import YOLO
 except Exception as e:
-    YOLO = None
-    YOLO_IMPORT_ERROR = str(e)
+    st.error(f"❌ Failed to load YOLO: {e}")
 
+    st.warning(
+    "⚠️ This app requires downloading ~1GB of packages (PyTorch + Ultralytics). "
+    "If the app crashes, please run locally in a Python environment with internet."
+)
 
 # ----------------------------- CONFIG -----------------------------
 st.set_page_config(page_title="Microplastic Detector", layout="wide", page_icon="🧫")
