@@ -1,3 +1,21 @@
 # Ignore Python virtual environments
 D:\microplastic_project\yolov8_env\
 D:\microplastic_project\microplastic-detection\microplastic-detection\.venv\
+
+# Ignore Python virtual environments
+.venv/
+yolov8_env/
+
+# Ignore YOLO run outputs
+microplastic-detection/microplastic-detection/runs/
+runs/
+
+# Ignore Python cache and temporary files
+__pycache__/
+*.pyc
+*.pyo
+
+# Ignore large files
+*.zip
+*.dll
+*.pyd
