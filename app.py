@@ -1,598 +1,387 @@
-# app.py
-"""
-Microplastic Detector — Final Presentation-Ready Streamlit App
-Features included:
- - Dark / Light (sky-blue) theme toggle without losing detection state
- - Centered original image + "Detect" flow: original initially centered; after detect it moves left and annotated appears right
- - KPIs displayed cleanly; detection table placed below KPIs to avoid overlap
- - Visualizations (Donut, Confidence bar, Histogram) inside expanders to reduce clutter
- - Session history with thumbnails (last 5 runs)
- - Download buttons (annotated image + CSV)
- - Clear / Reset controls
- - Robust handling of missing model, no-detections, and various ultralytics versions
- - Uses use_container_width=True (no deprecated use_column_width)
- - Theme-specific color palettes for charts and UI
-Instructions:
- - Update DEFAULT_MODEL_PATH to point to your YOLOv8 weights (absolute path)
- - Run: streamlit run app.py
-"""
-
-import os
+"""MicroDetect: single-class YOLO screening and geometric cluster analysis."""
+import hashlib
 import io
 import time
-import math
-from typing import Tuple, List, Dict, Any
+from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from PIL import Image
-import matplotlib.pyplot as plt
-from matplotlib import cm
+from PIL import Image, ImageDraw, ImageOps
 import streamlit as st
-import requests
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+from sklearn.preprocessing import StandardScaler
+
+ROOT = Path(__file__).resolve().parent
+MODEL_PATH = ROOT / "best.pt"
+FEATURES = ["width", "height", "area", "aspect_ratio"]
+COLUMNS = ["detection", "confidence", "x1", "y1", "x2", "y2", *FEATURES]
 
 
-
-# Attempt to import ultralytics YOLO
-try:
-    from ultralytics import YOLO
-except Exception as e:
-    YOLO = None
-    YOLO_IMPORT_ERROR = str(e)
-
-
-# ----------------------------- CONFIG -----------------------------
-st.set_page_config(page_title="Microplastic Detector", layout="wide", page_icon="🧫")
-st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
-
-header_html = f"""
-<div class="card" style="text-align:center; padding:20px;">
-  <div style="font-size:32px;">🔬 <b>MicroDetect</b></div>
-  <div style="margin-top:6px; font-size:15px;">
-</div>
-"""
-st.markdown(header_html, unsafe_allow_html=True)
-
-APP_TITLE = "⚛Microplastic Detector"
-APP_SUBTITLE = "📸Upload an image, detect microplastics using your YOLOv8 model, and present easy-to-understand visualizations."
-
-# ----------------------------- UTILITIES -----------------------------
-def color_map_for_values(n: int, cmap_name: str = "viridis") -> List[str]:
-    """Return n hex colors from a matplotlib colormap."""
-    cmap = cm.get_cmap(cmap_name)
-    return [cm.colors.to_hex(cmap(i / max(n - 1, 1))) for i in range(n)]
-
-def safe_filename(f) -> str:
-    try:
-        return getattr(f, "name", "uploaded_image")
-    except Exception:
-        return "uploaded_image"
-
-def pil_to_bytes(img: Image.Image, fmt: str = "PNG") -> bytes:
-    buf = io.BytesIO()
-    img.save(buf, format=fmt)
-    return buf.getvalue()
-
-# ----------------------------- SESSION STATE INIT -----------------------------
-if "theme" not in st.session_state:
-    st.session_state.theme = "dark"
-
-if "model_path" not in st.session_state:
-    st.session_state.model_path = "best.pt"
-
-if "image" not in st.session_state:
-    st.session_state.image = None
-
-if "annotated" not in st.session_state:
-    st.session_state.annotated = None
-
-if "df" not in st.session_state:
-    st.session_state.df = pd.DataFrame()
-
-if "history" not in st.session_state:
-    st.session_state.history = []
-
-if "model_loaded_for" not in st.session_state:
-    st.session_state.model_loaded_for = None
-
-if "stage" not in st.session_state:
-    st.session_state.stage = "initial"
-
-# ----------------------------- SIDEBAR: SETTINGS & THEME -----------------------------
-st.sidebar.markdown("## ⚙️ Settings")
-
-theme_choice = st.sidebar.radio("Theme", ["🌑 Dark", "🌕 Light (Sky Blue)"], index=0, key="theme_radio")
-st.session_state.theme = "dark" if theme_choice.startswith("🌑") else "light"
-
-device_choice = st.sidebar.selectbox("Device", ["GPU", "CPU"], index=0, key="device_choice")
-device = 0 if str(device_choice).startswith("GPU") else "CPU"
-
-conf_threshold = st.sidebar.slider("Confidence threshold", 0.0, 1.0, 0.25, 0.01, key="conf_threshold")
-max_display = st.sidebar.slider("Max detections shown in confidence plot", 5, 200, 60, key="max_display")
-box_thickness = st.sidebar.slider("Box thickness (px)", 1, 8, 2, key="box_thickness")
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("⚡ Quick Links")
-st.sidebar.markdown("[GitHub Repo](https://github.com/Triquetrus/microplastics-detector)")
-st.sidebar.markdown("[Streamlit Docs](https://docs.streamlit.io/)")
-st.sidebar.markdown("Tips:")
-st.sidebar.markdown("- Use a clear close-up image of the sample.")
-st.sidebar.markdown("- Increase confidence threshold to reduce false positives.")
-st.sidebar.markdown("- Use GPU if available for faster inference.")
-
-# ----------------------------- THEME STYLING -----------------------------
-if st.session_state.theme == "dark":
-    PAGE_BG = "linear-gradient(135deg, #0f1724 0%, #2b2143 40%, #6e5b7b 100%)"
-    CARD_BG = "rgba(255,255,255,0.04)"
-    TEXT_COLOR = "#e6eef6"
-    PRIMARY_COLOR = "#00f0ea"
-    SECONDARY_COLOR = "#ff33cc"
-    HIST_COLOR = "#ff33cc"
-    PIE_CMAP = "viridis"
-    CONF_CMAP = "plasma"
-    MT_FIG_FACE = "#0f1724"
-else:
-    PAGE_BG = "linear-gradient(135deg, #e6f7ff 0%, #c7f0ff 50%, #a0e8ff 100%)"
-    CARD_BG = "rgba(255,255,255,0.85)"
-    TEXT_COLOR = "#07263b"
-    PRIMARY_COLOR = "#0288d1"
-    SECONDARY_COLOR = "#ff7ab6"
-    HIST_COLOR = "#0077be"
-    PIE_CMAP = "Spectral"
-    CONF_CMAP = "coolwarm"
-    MT_FIG_FACE = "#e6f7ff"
-
-if st.session_state.theme == "dark":
-    WIDGET_BG = "#1e1e2f"
-    WIDGET_TEXT = "#f5f5f5"
-    WIDGET_ACCENT = PRIMARY_COLOR
-else:
-    WIDGET_BG = "#ffffff"
-    WIDGET_TEXT = "#07263b"
-    WIDGET_ACCENT = PRIMARY_COLOR
-
-st.markdown(
-    f"""
-    <style>
-      .stApp {{ background: {PAGE_BG}; color: {TEXT_COLOR}; }}
-      .stButton>button, .stDownloadButton>button {{
-          background-color: {WIDGET_BG};
-          color: {WIDGET_TEXT};
-          border: 1px solid {WIDGET_ACCENT};
-          border-radius: 8px;
-          padding: 0.4em 1em;
-      }}
-      .stButton>button:hover, .stDownloadButton>button:hover {{
-          background-color: {WIDGET_ACCENT};
-          color: white;
-      }}
-      div[data-baseweb="select"] > div {{
-          background-color: {WIDGET_BG};
-          color: {WIDGET_TEXT};
-      }}
-      .stSlider > div {{
-          color: {WIDGET_TEXT};
-      }}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-plt.rcParams.update({
-    "figure.facecolor": MT_FIG_FACE,
-    "axes.facecolor": MT_FIG_FACE,
-    "axes.edgecolor": TEXT_COLOR,
-    "axes.labelcolor": TEXT_COLOR,
-    "xtick.color": TEXT_COLOR,
-    "ytick.color": TEXT_COLOR,
-    "text.color": TEXT_COLOR,
-    "grid.color": "#2b2143" if st.session_state.theme == "dark" else "#c7f0ff",
-})
-
-# ----------------------------- MODEL LOADING (cached) -----------------------------
 @st.cache_resource
-def _cached_load_model(path: str):
-    if YOLO is None:
-        raise ImportError("ultralytics YOLO not available")
-    return YOLO(path)
-
-MODEL_URL = "https://drive.google.com/uc?export=download&id=1Rh85Qh47pdL763DkvnFsja_skovUU7eB"
-DEFAULT_MODEL_PATH = "best.pt"
-
-def download_file(url, filename):
-    with st.spinner(f"Downloading {filename}..."):
-        response = requests.get(url, stream=True)
-        total_size = int(response.headers.get('content-length', 0))
-        chunk_size = 1024
-        with open(filename, 'wb') as f:
-            for data in response.iter_content(chunk_size):
-                f.write(data)
-        st.success(f"✅ {filename} downloaded")
-
-uploaded_model = st.sidebar.file_uploader(
-    "Upload YOLOv8 model (.pt) to override the default", type=["pt"]
-)
-
-if uploaded_model is not None:
-    model_path = uploaded_model.name
-    with open(model_path, "wb") as f:
-        f.write(uploaded_model.getbuffer())
-    st.sidebar.success("✅ Custom model uploaded")
-else:
-    model_path = DEFAULT_MODEL_PATH
-    download_file(MODEL_URL, model_path)
-
-model = None
-model_error = None
-try:
-    with st.spinner("Loading YOLO model..."):
-        model = _cached_load_model(model_path)
-    st.sidebar.success("✅ Model loaded successfully")
-except Exception as e:
-    model_error = str(e)
-    st.sidebar.error(f"❌ Failed to load model: {model_error}")
+def load_model(path, signature):
+    from ultralytics import YOLO
+    model = YOLO(path, task="detect")
+    if model.task != "detect" or model.names != {0: "microplastic"}:
+        raise ValueError("Expected the single-class microplastic detection model.")
+    return model
 
 
-# ----------------------------- APP HEADER -----------------------------
-st.markdown(f"<div class='card'><div class='title'>{APP_TITLE}</div><div class='muted'>{APP_SUBTITLE}</div></div>", unsafe_allow_html=True)
-
-# ---------------- FILE UPLOAD ----------------
-# Inject CSS for file uploader button
-if theme_choice == "Light":
-    st.markdown(
-        """
-        <style>
-        div.stFileUploader button {
-            background-color: #e0e0e0 !important;
-            color: #000000 !important;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True
-    )
-else:
-    st.markdown(
-        """
-        <style>
-        div.stFileUploader button {
-            background-color: #333333 !important;
-            color: #ffffff !important;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True
-    )
-# File uploader with 10 MB limit
-if st.session_state.stage in ["initial", "uploaded"]:
-    uploaded = st.file_uploader("",
-        type=["jpg", "jpeg", "png"]
-    )
-    if uploaded:
-        if uploaded.size > 10 * 1024 * 1024:  # 10 MB limit
-            st.error("File too large! Maximum allowed size is 10 MB.")
-        else:
-            try:
-                pil_img = Image.open(uploaded).convert("RGB")
-                filename = safe_filename(uploaded)
-
-                # If a previous detection exists, push to history
-                if st.session_state.annotated is not None and not st.session_state.df.empty:
-                    st.session_state.history.append({
-                        "filename": st.session_state.history[-1]["filename"] if st.session_state.history else filename,
-                        "timestamp": time.strftime("%H:%M:%S"),
-                        "df": st.session_state.df,
-                        "annotated": st.session_state.annotated,
-                        "elapsed": st.session_state.history[-1]["elapsed"] if st.session_state.history else 0,
-                    })
-                    st.session_state.history = st.session_state.history[-5:]  # keep last 5
-
-                # Reset state for new image
-                st.session_state.image = pil_img
-                st.session_state.annotated = None
-                st.session_state.df = pd.DataFrame()
-                st.session_state.stage = "uploaded"  # move to uploaded stage
-
-            except Exception as e:
-                st.error(f"Failed to read uploaded image: {e}")
-
-
-
-# Helper: run inference robustly
-def run_yolo_inference(pil_img: Image.Image, model_obj: Any, conf: float, device_choice: Any, box_thickness_px: int = 2) -> Tuple[Image.Image, pd.DataFrame]:
-    """
-    Runs model on PIL image and returns annotated PIL image and detections DataFrame.
-    DF columns: class, confidence, x1,y1,x2,y2,width,height,area
-    """
-    # Inference
-    results = model_obj(pil_img, imgsz=640, conf=conf, device=device_choice)
-    r = results[0]
-
-    # Annotated image: ultralytics .plot() returns numpy array usually
-    ann = r.plot()
-    if isinstance(ann, np.ndarray):
-        annotated_img = Image.fromarray(ann)
-    else:
-        # fallback if some versions return PIL
-        annotated_img = ann if isinstance(ann, Image.Image) else Image.fromarray(np.array(ann))
-
-    boxes = getattr(r, "boxes", None)
+def extract_detection_features(result):
+    boxes = result.boxes
     if boxes is None or len(boxes) == 0:
-        df = pd.DataFrame(columns=["class", "confidence", "x1", "y1", "x2", "y2", "width", "height", "area"])
-        return annotated_img, df
+        return pd.DataFrame(columns=COLUMNS, dtype=float)
+    xy = boxes.xyxy.cpu().numpy().astype(float)
+    width = np.maximum(xy[:, 2] - xy[:, 0], 0)
+    height = np.maximum(xy[:, 3] - xy[:, 1], 0)
+    return pd.DataFrame(dict(detection=np.arange(1, len(xy) + 1),
+        confidence=boxes.conf.cpu().numpy(), x1=xy[:, 0], y1=xy[:, 1],
+        x2=xy[:, 2], y2=xy[:, 3], width=width, height=height,
+        area=width * height, aspect_ratio=np.divide(width, height,
+            out=np.zeros_like(width), where=height > 0)))
 
-    # Extract coordinates robustly; ultralytics has tensors .xyxy .conf .cls
+
+def run_inference(image, model, confidence, device):
+    start = time.perf_counter()
+    result = model.predict(image, conf=confidence, device=device, verbose=False)[0]
+    elapsed = time.perf_counter() - start
+    return extract_detection_features(result), elapsed
+
+
+def annotate_image(image, df, thickness):
+    annotated = image.copy()
+    draw = ImageDraw.Draw(annotated)
+    for row in df.itertuples():
+        draw.rectangle((row.x1, row.y1, row.x2, row.y2), outline="#14b8a6", width=thickness)
+        draw.text((row.x1 + 2, max(0, row.y1 - 12)),
+                  f"microplastic {row.confidence:.0%}", fill="#14b8a6", stroke_width=1, stroke_fill="#102030")
+    return annotated
+
+
+def image_statistics(df, image):
+    image_area = image.width * image.height
+    total_area = float(df.area.sum())
+    return {"count": len(df), "average_confidence": float(df.confidence.mean()) if len(df) else 0,
+            "highest_confidence": float(df.confidence.max()) if len(df) else 0,
+            "average_area": float(df.area.mean()) if len(df) else 0,
+            "total_area": total_area, "image_area": image_area,
+            "area_percentage": 100 * total_area / image_area}
+
+
+def calculate_cluster_metrics(scaled, labels):
+    groups = len(np.unique(labels))
+    silhouette = float(silhouette_score(scaled, labels)) if 1 < groups < len(scaled) else None
+    upper = min(5, len(scaled), len(np.unique(scaled, axis=0)))
+    elbow = [{"K": k, "WCSS": float(KMeans(n_clusters=k, random_state=42,
+               n_init="auto").fit(scaled).inertia_)} for k in range(1, upper + 1)]
+    return silhouette, pd.DataFrame(elbow)
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def run_kmeans(df, requested_k):
+    output = df.copy()
+    output["cluster"] = pd.Series(pd.NA, index=output.index, dtype="Int64")
+    values = df[FEATURES].to_numpy(dtype=float)
+    valid = np.isfinite(values).all(axis=1) & (values[:, 0] > 0) & (values[:, 1] > 0)
+    usable = values[valid]
+    unique = len(np.unique(usable, axis=0))
+    k = min(int(requested_k), len(usable), unique)
+    if k < 2:
+        return output, None, pd.DataFrame(), None, "At least two distinct, positive-size detections are needed for K-Means."
+    scaler = StandardScaler()
+    scaled = scaler.fit_transform(usable)
+    estimator = KMeans(n_clusters=k, random_state=42, n_init="auto").fit(scaled)
+    output.loc[valid, "cluster"] = estimator.labels_ + 1
+    silhouette, elbow = calculate_cluster_metrics(scaled, estimator.labels_)
+    centers = pd.DataFrame(scaler.inverse_transform(estimator.cluster_centers_), columns=FEATURES)
+    message = f"K = {k}; {len(usable)} particles. Features: width, height, area, aspect ratio."
+    if k != requested_k:
+        message += " K was reduced to the number of distinct usable detections."
+    if not valid.all():
+        message += " Degenerate or nonfinite boxes were excluded."
+    return output, silhouette, elbow, centers, message
+
+
+def file_digest(path):
+    with Path(path).open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+@st.cache_data(show_spinner=False)
+def load_training_metrics(model_path, signature, inventory):
+    """Only associate artifacts with a byte-identical checkpoint, never by run name."""
     try:
-        xyxy = boxes.xyxy.cpu().numpy()
-        confs = boxes.conf.cpu().numpy()
-        clses = boxes.cls.cpu().numpy().astype(int)
-    except Exception:
-        # fallback: iterate boxes
-        xyxy = np.array([b.xyxy.cpu().numpy().reshape(-1) for b in boxes])
-        confs = np.array([float(b.conf) for b in boxes])
-        clses = np.array([int(b.cls) for b in boxes])
-
-    # class names
-    names = []
-    for c in clses:
-        try:
-            names.append(model_obj.names[int(c)])
-        except Exception:
-            names.append(str(int(c)))
-
-    widths = xyxy[:, 2] - xyxy[:, 0]
-    heights = xyxy[:, 3] - xyxy[:, 1]
-    areas = widths * heights
-
-    df = pd.DataFrame({
-        "class": names,
-        "confidence": np.round(confs, 4),
-        "x1": np.round(xyxy[:, 0], 1),
-        "y1": np.round(xyxy[:, 1], 1),
-        "x2": np.round(xyxy[:, 2], 1),
-        "y2": np.round(xyxy[:, 3], 1),
-        "width": np.round(widths, 1),
-        "height": np.round(heights, 1),
-        "area": np.round(areas, 1),
-    })
-
-    return annotated_img, df
-
-# ---------------- DETECT BUTTON ----------------
-if st.session_state.stage == "uploaded" and st.session_state.image is not None:
-    st.markdown("<div class='card'><b>Preview (Original)</b></div>", unsafe_allow_html=True)
-    st.image(st.session_state.image, use_container_width=True)
-
-    detect_col1, detect_col2, detect_col3 = st.columns([1, 1, 1])
-    with detect_col2:
-        if st.button("🚀 Detect Microplastics"):
-            if model is None:
-                st.error("Model not loaded — fix the model path in the sidebar.")
-            else:
-                with st.spinner("Running YOLO inference..."):
-                    t0 = time.time()
-                    try:
-                        annotated_img, df = run_yolo_inference(
-                            st.session_state.image, model, conf_threshold, device, box_thickness
-                        )
-                    except Exception as e:
-                        st.error(f"Inference error: {e}")
-                        annotated_img, df = None, pd.DataFrame()
-                    elapsed = time.time() - t0
-
-                st.session_state.annotated = annotated_img
-                st.session_state.df = df
-                st.session_state.stage = "detected"
-
-                # add to history
-                st.session_state.history.append({
-                    "filename": safe_filename(st.session_state.image) if st.session_state.image else "uploaded_image",
-                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "df": df.copy(),
-                    "annotated": annotated_img,
-                    "elapsed": elapsed,
-                })
-                st.session_state.history = st.session_state.history[-5:]
-                st.rerun()
+        digest = file_digest(model_path)
+        for csv_name, _, _ in inventory:
+            csv_path = Path(csv_name)
+            checkpoint = csv_path.parent / "weights" / "best.pt"
+            if not checkpoint.is_file() or file_digest(checkpoint) != digest:
+                continue
+            history = pd.read_csv(csv_path)
+            history.columns = history.columns.str.strip()
+            history = history.apply(pd.to_numeric, errors="coerce")
+            candidates = {"precision": "metrics/precision", "recall": "metrics/recall",
+                          "map50": "metrics/mAP50", "map95": "metrics/mAP50-95"}
+            columns = {key: next((c for c in history if c in (prefix, prefix + "(B)")), None)
+                       for key, prefix in candidates.items()}
+            if columns["map95"] is None or history[columns["map95"]].dropna().empty:
+                return csv_path.parent, history, columns, None
+            best = history.loc[history[columns["map95"]].idxmax()]
+            return csv_path.parent, history, columns, best
+    except (OSError, ValueError, pd.errors.ParserError):
+        pass
+    return None, pd.DataFrame(), {}, None
 
 
-# ---------------- TOP CONTROL BUTTONS ----------------
-if st.session_state.stage == "detected":
-    top_col1, top_col2 = st.columns([1, 1])
-    with top_col1:
-        if st.button("🔄 Upload a New Image"):
-            # Reset for new upload
-            st.session_state.image = None
-            st.session_state.annotated = None
-            st.session_state.df = pd.DataFrame()
-            st.session_state.stage = "initial"
-            st.rerun()
-    with top_col2:
-        if st.button("🗑️ Clear All"):
-            st.session_state.image = None
-            st.session_state.annotated = None
-            st.session_state.df = pd.DataFrame()
-            st.session_state.history = []
-            st.session_state.stage = "initial"
-            st.rerun()
-    
-# ----------------------------- AFTER DETECTION: SIDE-BY-SIDE, KPIs, TABLE & VISUALS -----------------------------
-if st.session_state.annotated is not None and st.session_state.image is not None:
-    # Side-by-side original (left) and annotated (right)
-    left_col, right_col = st.columns([1, 1])
-    with left_col:
-        st.markdown("<div class='card'><b>Original</b></div>", unsafe_allow_html=True)
-        st.image(st.session_state.image, use_container_width=True)
-    with right_col:
-        st.markdown("<div class='card'><b>Annotated (YOLO Detection)</b></div>", unsafe_allow_html=True)
-        st.image(st.session_state.annotated, use_container_width=True)
+def show_plot(fig):
+    fig.tight_layout()
+    st.pyplot(fig, width="stretch")
+    plt.close(fig)
 
-    # KPIs arranged neatly beneath images
-    st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)  # spacing
-    k1, k2, k3, k4 = st.columns([1, 1, 1, 1])
-    df = st.session_state.df if isinstance(st.session_state.df, pd.DataFrame) else pd.DataFrame()
-    with k1:
-        st.markdown("<div class='card'><b>Detections</b></div>", unsafe_allow_html=True)
-        st.markdown(f"<div class='pill'>{len(df)}</div>", unsafe_allow_html=True)
-    with k2:
-        st.markdown("<div class='card'><b>Top Type</b></div>", unsafe_allow_html=True)
-        top_type = df["class"].mode()[0] if not df.empty else "—"
-        st.markdown(f"<div class='pill'>{top_type}</div>", unsafe_allow_html=True)
-    with k3:
-        st.markdown("<div class='card'><b>Avg Confidence</b></div>", unsafe_allow_html=True)
-        avg_conf = float(df["confidence"].mean()) if not df.empty else 0.0
-        st.markdown(f"<div class='pill'>{avg_conf:.3f}</div>", unsafe_allow_html=True)
-    with k4:
-        st.markdown("<div class='card'><b>Last Run Time</b></div>", unsafe_allow_html=True)
-        last_elapsed = st.session_state.history[-1]["elapsed"] if st.session_state.history else 0.0
-        st.markdown(f"<div class='pill'>{last_elapsed:.2f}s</div>", unsafe_allow_html=True)
 
-    st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)  # spacing before table
+def plot_training_history(history, columns):
+    if "epoch" not in history:
+        st.info("Epoch column unavailable; training curves cannot be plotted.")
+        return
+    for loss in ("box_loss", "cls_loss", "dfl_loss"):
+        available = [c for c in (f"train/{loss}", f"val/{loss}") if c in history]
+        if available:
+            fig, ax = plt.subplots(figsize=(8, 2.8))
+            for col in available:
+                ax.plot(history.epoch, history[col], label=col)
+            ax.set(xlabel="Epoch", ylabel="Loss", title=loss.replace("_", " ").title())
+            ax.legend()
+            show_plot(fig)
+    available = [c for c in columns.values() if c]
+    if available:
+        st.line_chart(history.set_index("epoch")[available], x_label="Epoch", y_label="Validation metric")
 
-    # Detection table placed below KPIs to avoid overlap
-    st.markdown("<div class='card'><b>Detections Table</b></div>", unsafe_allow_html=True)
-    if df.empty:
-        st.info("No detections to show. Try lowering the confidence threshold or providing a clearer image.")
+
+def render_performance():
+    inventory = []
+    for csv in ROOT.glob("**/runs/**/results.csv"):
+        checkpoint = csv.parent / "weights" / "best.pt"
+        if checkpoint.exists():
+            inventory.append((str(csv), csv.stat().st_mtime_ns, checkpoint.stat().st_mtime_ns))
+    signature = MODEL_PATH.stat().st_mtime_ns if MODEL_PATH.exists() else None
+    run, history, columns, best = load_training_metrics(str(MODEL_PATH), signature, tuple(sorted(inventory)))
+    if run is None:
+        st.info("Training metrics unavailable for the currently loaded model.")
+        return
+    st.caption(f"Verified by identical SHA-256 checkpoint • {run.relative_to(ROOT)} • VALIDATION metrics")
+    if best is not None:
+        values = {k: float(best[c]) if c and pd.notna(best[c]) else None for k, c in columns.items()}
+        p, r = values["precision"], values["recall"]
+        f1 = 2 * p * r / (p + r) if p is not None and r is not None and p + r else (0 if p == r == 0 else None)
+        for col, label, value in zip(st.columns(5), ["Precision", "Recall", "F1 Score", "mAP@50", "mAP@50-95"],
+                                    [p, r, f1, values["map50"], values["map95"]]):
+            col.metric(label, f"{value:.3f}" if value is not None else "Unavailable")
+        st.caption(f"Best Epoch: {int(best['epoch']) if 'epoch' in best and pd.notna(best['epoch']) else 'Unavailable'} • maximum validation mAP@50-95. F1 is calculated from that epoch’s precision and recall.")
     else:
-        # show table with coordinates and sizes
-        st.dataframe(df.reset_index(drop=True), use_container_width=True, height=260)
+        st.info("Best-epoch validation metrics unavailable in this results.csv.")
+    st.markdown("#### Training and validation")
+    st.caption("Training loss = model error on training data. Validation loss = model error on unseen validation data. Both poor may suggest underfitting; training improves while validation deteriorates may suggest overfitting; both improve or stabilize suggests healthier generalization. These are diagnostic patterns, not a diagnosis of this run.")
+    plot_training_history(history, columns)
+    matrix = next((run / n for n in ["confusion_matrix_normalized.png", "confusion_matrix.png"] if (run / n).is_file()), None)
+    st.markdown("#### Validation Confusion Matrix")
+    st.caption("For a single-class detector, this primarily helps visualize correct microplastic detections versus background-related errors. Run-level exported artifacts may use a different operating threshold from the current image settings.")
+    if matrix:
+        try:
+            st.image(Image.open(matrix), width=680)
+        except (OSError, ValueError):
+            st.info("The saved confusion matrix could not be read.")
+    else:
+        st.info("No saved confusion matrix exists for this verified run.")
 
-   # ---------------- VISUALIZATIONS ----------------
-    with st.expander("📊 Type Distribution "):
-        fig, ax = plt.subplots(figsize=(5, 4))
-        if df.empty:
-            ax.text(0.5, 0.5, "No detections", ha="center", va="center", color=TEXT_COLOR, fontsize=14)
-        else:
-            counts = df["class"].value_counts()
-            labels = counts.index.tolist()
-            values = counts.values.tolist()
-            colors = color_map_for_values(len(labels), PIE_CMAP)
-            if len(labels) == 1:
-                ax.pie([1.0], labels=[labels[0]], colors=[colors[0]], startangle=90,
-                       wedgeprops=dict(width=0.45, edgecolor=MT_FIG_FACE))
-                ax.text(0, 0, "100%", ha="center", va="center", fontsize=18,
-                        color=TEXT_COLOR, fontweight="bold")
-            else:
-                wedges, _, autotexts = ax.pie(
-                    values,
-                    labels=labels,
-                    autopct=lambda pct: f"{pct:.1f}%" if pct >= 2 else "",
-                    pctdistance=0.75,
-                    startangle=90,
-                    colors=colors,
-                    wedgeprops=dict(width=0.45, edgecolor=MT_FIG_FACE)
-                )
-                ax.legend(wedges, [f"{l}: {v}" for l, v in zip(labels, values)],
-                          bbox_to_anchor=(1.02, 0.6), loc="center left", frameon=False)
-        ax.set_aspect("equal")
-        st.pyplot(fig)
-        st.caption("Donut shows what % of detected objects belong to each microplastic type.")
 
-    with st.expander("📈 Confidence of Detections"):
-        fig2_height = max(3, 0.25 * min(len(df), max_display) + 1.2)
-        fig2, ax2 = plt.subplots(figsize=(8, fig2_height))
-        if df.empty:
-            ax2.text(0.5, 0.5, "No detections", ha="center", va="center", color=TEXT_COLOR, fontsize=14)
-        else:
-            df_sorted = df.sort_values("confidence", ascending=False).reset_index(drop=True)
-            df_plot = df_sorted.head(max_display)
-            colors = color_map_for_values(len(df_plot), CONF_CMAP)[::-1]
-            y_pos = np.arange(len(df_plot))
-            ax2.barh(y_pos, df_plot["confidence"], color=colors, edgecolor="#0b0b0b", height=0.6)
-            ax2.set_yticks(y_pos)
-            ax2.set_yticklabels([f"{i+1}: {c}" for i, c in enumerate(df_plot["class"].tolist())], fontsize=9)
-            ax2.invert_yaxis()
-            ax2.set_xlim(0, 1.02)
-            ax2.set_xlabel("Confidence (0–1)")
-            ax2.set_title(f"Top {len(df_plot)} Detections by Confidence")
-            for i, v in enumerate(df_plot["confidence"]):
-                ax2.text(v + 0.01, i, f"{v:.3f}", va="center", color=TEXT_COLOR, fontsize=9)
-        plt.tight_layout()
-        st.pyplot(fig2)
-        st.caption("Each bar shows how confident the model was for a detection. Higher = more confident.")
+def render_concepts():
+    cards = [
+        ("Supervised Learning", "In YOLO training, labelled images teach the model to locate microplastic particles. The trained model predicts their locations in unseen images. Implementation: YOLO object detection."),
+        ("Classification / Object Detection", "Object detection combines localization (where is the microplastic?) and classification (is it a microplastic?). This model has one class: microplastic."),
+        ("Precision", "Of the detections predicted as microplastic, how many were correct? Precision = TP / (TP + FP)."),
+        ("Recall", "Of the actual microplastics present, how many did the model detect? Recall = TP / (TP + FN)."),
+        ("F1 Score", "Balances precision and recall. F1 = 2PR / (P + R). Confidence on uploaded images is not an accuracy metric."),
+        ("mAP", "Mean Average Precision evaluates object detection. mAP50 uses IoU 0.50; mAP50-95 averages IoU thresholds from 0.50 to 0.95. IoU measures box overlap with ground truth."),
+        ("Overfitting / Underfitting", "Compare real training and validation curves in Model Performance. Improving training loss with deteriorating validation loss may indicate overfitting. Poor performance on both may indicate underfitting."),
+        ("Unsupervised Learning", "K-Means groups detected particles by geometric similarity without predefined cluster labels. It does not identify polymer types or improve YOLO accuracy."),
+        ("Feature Scaling", "StandardScaler centers each feature and scales its variance, preventing large numeric ranges such as area from dominating K-Means distances."),
+        ("Cluster Validation", "Silhouette measures separation and cohesion: closer to 1 is better separated, near 0 means overlap, negative values suggest poor assignment. An elbow in WCSS can guide K; neither proves scientific categories.")]
+    cols = st.columns(2)
+    for i, (title, body) in enumerate(cards):
+        with cols[i % 2], st.container(border=True):
+            st.markdown(f"#### {title}")
+            st.write(body)
 
-    with st.expander("📉 Size Distribution (Histogram)"):
-        fig3, ax3 = plt.subplots(figsize=(9, 3))
-        if df.empty:
-            ax3.text(0.5, 0.5, "No detections", ha="center", va="center", color=TEXT_COLOR, fontsize=14)
-        else:
-            widths = df["width"]
-            bins = min(12, max(4, int(math.sqrt(len(widths)) * 2)))
-            n_vals, bins_edges, patches = ax3.hist(widths, bins=bins, color=HIST_COLOR,
-                                                  edgecolor=MT_FIG_FACE, alpha=0.95)
-            ax3.set_xlabel("Width (pixels)")
-            ax3.set_ylabel("Frequency")
-            ax3.set_title("Histogram of Detected Object Widths")
-            for rect in patches:
-                h = rect.get_height()
-                if h > 0:
-                    ax3.text(rect.get_x() + rect.get_width()/2.0, h+0.05, f"{int(h)}",
-                             ha="center", va="bottom", color=TEXT_COLOR, fontsize=9)
-        plt.tight_layout()
-        st.pyplot(fig3)
-        st.caption("Shows how many detected plastics fall into each size range (in pixels).")
 
-    # Downloads & auxiliary controls
-    dl_col1, dl_col2, dl_col3 = st.columns([1, 1, 1])
-    with dl_col1:
-        if st.session_state.annotated is not None:
-            annotated_bytes = pil_to_bytes(st.session_state.annotated, fmt="PNG")
-            st.download_button("⬇️ Download annotated image", data=annotated_bytes, file_name="microplastic_annotated.png", mime="image/png")
-    with dl_col2:
-        if not df.empty:
-            csv_bytes = df.to_csv(index=False).encode("utf-8")
-            st.download_button("⬇️ Download detections CSV", data=csv_bytes, file_name="detections.csv", mime="text/csv")
-    with dl_col3:
-        if st.button("Clear last detection"):
-            st.session_state.annotated = None
-            st.session_state.df = pd.DataFrame()
-            # keep history but remove last entry
-            if st.session_state.history:
-                st.session_state.history.pop()
-            st.rerun()
-# ----------------------------- SESSION HISTORY (last 5) -----------------------------
-if st.session_state.history:
-        st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
-        st.markdown("<div class='card'><b>🗂️ Recent detections (this session)</b></div>", unsafe_allow_html=True)
-        recent_entries = st.session_state.history[-5:][::-1]
-        for entry in recent_entries:
-            with st.expander(f"{entry['filename']} • {entry['timestamp']}"):
-                hk1, hk2, hk3, hk4 = st.columns(4)
-                hk1.metric("Detections", len(entry["df"]))
-                hk2.metric("Top Type", entry["df"]["class"].mode()[0] if not entry["df"].empty else "—")
-                hk3.metric("Avg Confidence", f"{entry['df']['confidence'].mean():.3f}" if not entry["df"].empty else "0.0")
-                hk4.metric("Last Run Time", f"{entry['elapsed']:.2f}s")
-                hcol1, hcol2 = st.columns([1, 1])
-                with hcol1:
-                    if entry.get("annotated") is not None:
-                        st.image(entry["annotated"], use_container_width=True)
-                with hcol2:
-                    if not entry["df"].empty:
-                        st.dataframe(entry["df"].reset_index(drop=True), use_container_width=True, height=220)
-    
+def pil_to_bytes(image):
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
 
-# ----------------------------- FOOTER -----------------------------
-st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
 
-footer_html = f"""
-<div class="card" style="text-align:center; padding:20px;">
-  <div style="font-size:22px;">֎ <b>Advanced AI-powered Microplastic Detection</b></div>
-  <div style="margin-top:6px; font-size:15px; color:{TEXT_COLOR};">
-    For environmental research, monitoring, and marine protection.
-  </div>
-  <hr style="margin:12px 0; border: none; border-top: 1px solid rgba(200,200,200,0.2);" />
-  <div style="display:flex; flex-wrap:wrap; justify-content:center; gap:12px; font-size:14px;">
-    <span style="padding:4px 10px; border-radius:20px; background:rgba(255,255,255,0.08);">🧠 YOLOv8 Deep Learning</span>
-    <span style="padding:4px 10px; border-radius:20px; background:rgba(255,255,255,0.08);">🌐 Computer Vision</span>
-    <span style="padding:4px 10px; border-radius:20px; background:rgba(255,255,255,0.08);">🌍 Environmental Analysis</span>
-    <span style="padding:4px 10px; border-radius:20px; background:rgba(255,255,255,0.08);">📊 Research</span>
-    <span style="padding:4px 10px; border-radius:20px; background:rgba(255,255,255,0.08);">🌱 Environmental Impact</span>
-    <span style="padding:4px 10px; border-radius:20px; background:rgba(255,255,255,0.08);">🐟 Marine Biology</span>
-    <span style="padding:4px 10px; border-radius:20px; background:rgba(255,255,255,0.08);">🚨 Pollution Monitoring</span>
-  </div>
-  <div style="margin-top:14px; font-size:13px; opacity:0.8;">
-    ©2025 Microplastic Detection AI. Advancing environmental science through artificial intelligence.
-  </div>
-</div>
-"""
+def render_results(entry, enabled, k, thickness):
+    df = entry["df"].copy()
+    cluster_data = None
+    if enabled:
+        try:
+            cluster_data = run_kmeans(df, k)
+            df = cluster_data[0]
+        except (ValueError, RuntimeError) as exc:
+            st.warning(f"Clustering unavailable: {exc}")
+    if "cluster" not in df:
+        df["cluster"] = pd.Series(pd.NA, index=df.index, dtype="Int64")
+    annotated = annotate_image(entry["image"], df, thickness)
+    overview, detections, clustering, performance, concepts = st.tabs(["Overview", "Detections", "Clustering", "Model Performance", "ML Concepts"])
+    with overview:
+        left, right = st.columns(2)
+        for column, title, image in [(left, "ORIGINAL", entry["image"]), (right, "YOLO DETECTION", annotated)]:
+            with column:
+                st.caption(title)
+                preview = image.copy()
+                preview.thumbnail((720, 420))
+                st.image(preview, width="content")
+        stats = image_statistics(df, entry["image"])
+        for col, label, value in zip(st.columns(4), ["DETECTED PARTICLES", "AVG CONFIDENCE", "HIGHEST CONFIDENCE", "INFERENCE TIME"],
+                [stats["count"], f"{stats['average_confidence']:.1%}", f"{stats['highest_confidence']:.1%}", f"{entry['elapsed']:.2f} s"]):
+            col.metric(label, value)
+        st.markdown("#### Detection Summary")
+        st.write(f"{len(df)} candidate microplastic particles were detected in this image." if len(df) else "No particles detected above the selected confidence threshold.")
+        st.caption(f"Processed at confidence ≥ {entry['confidence']:.0%} on {entry['device']}. Change the threshold and process again to update predictions.")
+        st.write(f"Approximate detected-area percentage: **{stats['area_percentage']:.2f}%** · Mean box area: **{stats['average_area']:,.1f} px²** · Total box area: **{stats['total_area']:,.1f} px²** · Image area: **{stats['image_area']:,} px²**")
+        st.caption("Image-based measurement: sum of bounding-box areas / image area. Boxes include surrounding pixels and may overlap, so the percentage can exceed 100%. This is not environmental concentration.")
+        if len(df):
+            for col, feature, title, label in zip(st.columns(2), ["confidence", "area"], ["Confidence distribution", "Size distribution"], ["Confidence", "Bounding-box area (px²)"]):
+                with col:
+                    fig, ax = plt.subplots(figsize=(5, 2.6))
+                    ax.hist(df[feature], bins=min(15, max(3, int(np.sqrt(len(df))))), color="#14b8a6", edgecolor="#102030")
+                    ax.set(title=title, xlabel=label, ylabel="Particles")
+                    show_plot(fig)
+    with detections:
+        display = df.copy()
+        display["confidence"] = display.confidence * 100
+        display["cluster"] = display.cluster.map(lambda x: f"Cluster {int(x)}" if pd.notna(x) else "—")
+        display = display.rename(columns={c: c.replace("_", " ").title() for c in display})
+        st.dataframe(display.round(2), hide_index=True, width="stretch", column_config={"Confidence": st.column_config.NumberColumn("Confidence", format="%.1f%%")})
+        st.caption("Coordinates and dimensions are pixels; area is px². CSV confidence is a fraction (0–1); cluster IDs start at 1.")
+        a, b = st.columns(2)
+        stem = Path(entry["filename"]).stem
+        a.download_button("Download detections CSV", df.to_csv(index=False).encode(), file_name=f"{stem}_detections.csv", mime="text/csv")
+        b.download_button("Download annotated image", pil_to_bytes(annotated), file_name=f"{stem}_annotated.png", mime="image/png")
+    with clustering:
+        st.markdown("#### K-Means Particle Clusters")
+        st.caption("Detected particles are grouped according to geometric similarity. These clusters are data-driven and do not represent polymer chemistry.")
+        st.caption("YOLO detections → geometric features → StandardScaler → K-Means → particle clusters")
+        if not enabled:
+            st.info("Enable K-Means in the sidebar to analyze particle geometry.")
+        elif cluster_data:
+            _, silhouette, elbow, centers, message = cluster_data
+            st.info(message)
+            if centers is not None:
+                fig, ax = plt.subplots(figsize=(7, 3.4))
+                cmap = matplotlib.colormaps.get_cmap("viridis")
+                for cluster, group in df.dropna(subset=["cluster"]).groupby("cluster"):
+                    ax.scatter(group.area, group.aspect_ratio, color=cmap((int(cluster)-1)/max(len(centers)-1, 1)), label=f"Cluster {cluster}", alpha=.8)
+                ax.scatter(centers.area, centers.aspect_ratio, marker="X", s=150, c="#f59e0b", edgecolors="black", label="Centers")
+                ax.set(xlabel="Area (px²)", ylabel="Aspect ratio", title="K-Means Particle Clusters")
+                ax.legend()
+                show_plot(fig)
+                st.caption("This is a two-feature projection of clustering in four scaled dimensions; centers are converted back to original units.")
+                summary = df.dropna(subset=["cluster"]).groupby("cluster").agg(**{"Particle Count": ("detection", "count"), "Mean Width": ("width", "mean"), "Mean Height": ("height", "mean"), "Mean Area": ("area", "mean"), "Mean Aspect Ratio": ("aspect_ratio", "mean"), "Mean Confidence": ("confidence", "mean")}).reset_index()
+                summary["cluster"] = summary.cluster.map(lambda x: f"Cluster {x}")
+                st.dataframe(summary.rename(columns={"cluster": "Cluster"}).round(3), hide_index=True, width="stretch")
+                st.metric("Silhouette Score", f"{silhouette:.3f}" if silhouette is not None else "Not defined")
+                st.caption("Closer to 1 = better separated clusters. Near 0 = overlapping clusters. Requires 2 through n−1 distinct clusters; K = n is not valid for silhouette.")
+                st.line_chart(elbow.set_index("K"), x_label="K", y_label="WCSS / inertia")
+                st.caption("Elbow Method: look for diminishing reductions in within-cluster sum of squares. With very few particles, an elbow is not reliable.")
+    with performance:
+        render_performance()
+    with concepts:
+        render_concepts()
 
-st.markdown(footer_html, unsafe_allow_html=True)
+
+def main():
+    st.set_page_config(page_title="MicroDetect", page_icon="🔬", layout="wide")
+    st.sidebar.markdown("## MicroDetect")
+    st.sidebar.markdown("#### MODEL")
+    model_status = st.sidebar.empty()
+    model = None
+    device = "cpu"
+    try:
+        import torch
+        device = 0 if torch.cuda.is_available() else "cpu"
+        model = load_model(str(MODEL_PATH), MODEL_PATH.stat().st_mtime_ns)
+        model_status.success("● Model Ready")
+    except Exception as exc:
+        model_status.error(f"Model unavailable: {exc}")
+    st.sidebar.caption(f"Model: best.pt · Device: {'GPU' if device == 0 else 'CPU'}")
+    st.sidebar.markdown("#### DETECTION SETTINGS")
+    confidence = st.sidebar.slider("Confidence threshold", .01, 1., .25, .01)
+    thickness = st.sidebar.slider("Bounding-box thickness", 1, 8, 2)
+    st.sidebar.markdown("#### CLUSTERING")
+    enabled = st.sidebar.toggle("Enable K-Means", value=True)
+    k = st.sidebar.slider("Number of clusters", 2, 5, 3, disabled=not enabled)
+    st.sidebar.markdown("#### DISPLAY")
+    theme = st.sidebar.radio("Theme", ["Dark", "Light"], horizontal=True)
+    dark = theme == "Dark"
+    bg, card, text, border = ("#0b1220", "#132033", "#e6edf5", "#27394c") if dark else ("#f4f8fb", "#ffffff", "#10283e", "#cbd9e5")
+    st.markdown(f"""<style>
+    .stApp {{background:{bg}; color:{text}; color-scheme:{'dark' if dark else 'light'}; --text-color:{text}; --background-color:{bg}; --secondary-background-color:{card};}}
+    [data-testid="stSidebar"], [data-testid="stHeader"] {{background:{card};}}
+    .stApp h1,.stApp h2,.stApp h3,.stApp h4,.stApp label,.stApp p {{color:{text};}}
+    .block-container {{padding-top:2rem; max-width:1280px;}}
+    [data-testid="stMetric"], [data-testid="stVerticalBlockBorderWrapper"] {{background:{card}; border:1px solid {border}; border-radius:12px; padding:12px;}}
+    .stButton button,.stDownloadButton button {{background:{card}; color:{text}; border:1px solid #14b8a6; border-radius:8px;}}
+    [data-baseweb="select"]>div,[data-testid="stFileUploaderDropzone"] {{background:{card}; color:{text};}}
+    .badge {{display:inline-block; border:1px solid {border}; border-radius:20px; padding:4px 12px; margin:0 6px 8px 0; color:#14b8a6; font-size:12px;}}
+    </style>""", unsafe_allow_html=True)
+    plt.rcParams.update({"figure.facecolor": bg, "axes.facecolor": bg, "text.color": text,
+                         "axes.labelcolor": text, "xtick.color": text, "ytick.color": text, "axes.edgecolor": border})
+    st.title("MicroDetect")
+    st.markdown("**AI-Powered Microplastic Detection & Analysis**")
+    st.markdown(''.join(f'<span class="badge">{b}</span>' for b in ["YOLO Detection", "Supervised ML", "K-Means Clustering", "Unsupervised ML"]), unsafe_allow_html=True)
+    st.write("Detect microplastics from sample images and analyze their geometric patterns using supervised and unsupervised machine learning.")
+    st.session_state.setdefault("samples", [])
+    st.session_state.setdefault("upload_version", 0)
+    st.markdown("### Upload Sample Images")
+    uploads = st.file_uploader("Sample images · JPG, JPEG, PNG · up to 10 MB each", type=["jpg", "jpeg", "png"], accept_multiple_files=True, key=f"uploads_{st.session_state.upload_version}")
+    a, b = st.columns([1, 4])
+    process = a.button("Process Images", type="primary", disabled=not uploads or model is None)
+    if b.button("Clear session", disabled=not st.session_state.samples and not uploads):
+        st.session_state.samples = []
+        st.session_state.upload_version += 1
+        st.rerun()
+    if process:
+        with st.spinner("Processing sample images…"):
+            for upload in uploads:
+                try:
+                    if upload.size > 10 * 1024 * 1024:
+                        raise ValueError("Maximum file size is 10 MB.")
+                    image = ImageOps.exif_transpose(Image.open(io.BytesIO(upload.getvalue()))).convert("RGB")
+                    df, elapsed = run_inference(image, model, confidence, device)
+                    st.session_state.samples.append(dict(filename=upload.name, image=image, df=df, elapsed=elapsed,
+                        confidence=confidence, device="GPU" if device == 0 else "CPU", timestamp=time.strftime("%H:%M:%S")))
+                except Exception as exc:
+                    st.error(f"Could not process {upload.name}: {exc}")
+    if st.session_state.samples:
+        samples = st.session_state.samples
+        selected = st.selectbox("Session images", range(len(samples)), index=len(samples)-1,
+            format_func=lambda i: f"{i+1}. {samples[i]['filename']} · {samples[i]['timestamp']} · {len(samples[i]['df'])} detections")
+        render_results(samples[selected], enabled, k, thickness)
+        with st.expander("Recent session images"):
+            for col, entry in zip(st.columns(min(5, len(samples))), samples[-5:]):
+                col.image(entry["image"], caption=entry["filename"], width=100)
+    else:
+        st.info("Upload sample images and select Process Images to begin.")
+        performance, concepts = st.tabs(["Model Performance", "ML Concepts"])
+        with performance:
+            render_performance()
+        with concepts:
+            render_concepts()
+    st.caption("Results are image-based screening outputs and should not be interpreted as laboratory-confirmed concentration or toxicity. Chemical identification may require FTIR or Raman spectroscopy.")
+
+
+if __name__ == "__main__":
+    main()
